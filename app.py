@@ -1,11 +1,12 @@
-# app.py – PrivacyGuardian Chatbot with Deletion Requests stored in MongoDB
-# Run: pip install fastapi uvicorn httpx python-dotenv motor
-# Then: python app.py
+# app.py – PrivacyGuardian Chatbot (Standalone, Vercel‑ready)
+# Run locally: uvicorn app:app --reload
+# Deploy on Vercel with requirements.txt and vercel.json
 
 import os
 import json
 import logging
 import datetime
+import random
 from collections import deque
 from typing import Dict, Optional
 
@@ -16,16 +17,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# Import real backend services (still used for compliance logging)
-from services.deletion_service import DeletionService
-from services.compliance_logger import ComplianceLogger
-
-# ===================== CONFIGURATION =====================
-HF_TOKEN = "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"  # Replace with your actual token
-MODEL_NAME = "deepseek-ai/DeepSeek-R1:fastest"
-API_URL = "https://router.huggingface.co/v1/chat/completions"
-
+# ===================== CONFIGURATION (from environment) =====================
+HF_TOKEN = os.getenv("HF_TOKEN", "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")  # Replace fallback
+MODEL_NAME = os.getenv("MODEL_NAME", "deepseek-ai/DeepSeek-R1:fastest")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://babinraj23comp_db_user:oygb4xukCMnKPWS0@chatbot.dwwgtcw.mongodb.net/?appName=Chatbot")
+
+# ===================== MongoDB CONNECTION =====================
 client = AsyncIOMotorClient(MONGO_URI)
 db = client.privacyguardian
 
@@ -112,7 +109,7 @@ Return ONLY a valid JSON object with the following fields:
     logger.info(f"Sending request to Hugging Face router with model {MODEL_NAME}")
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            response = await client.post(API_URL, json=payload, headers=headers)
+            response = await client.post("https://router.huggingface.co/v1/chat/completions", json=payload, headers=headers)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -138,10 +135,9 @@ def parse_ai_response(llm_response: dict) -> dict:
         return {"action": "unknown", "response": "I'm having trouble understanding. Could you rephrase?"}
 
 # ===================== KEYWORD FALLBACK =====================
-async def keyword_fallback(user_id: str, message: str, logger_svc) -> dict:
+async def keyword_fallback(user_id: str, message: str) -> dict:
     msg_lower = message.lower()
 
-    # ----- Answer common questions -----
     if "rights under dpdp" in msg_lower or "what are my rights" in msg_lower:
         return {
             "action": "respond",
@@ -158,13 +154,10 @@ async def keyword_fallback(user_id: str, message: str, logger_svc) -> dict:
             "response": "I'm PrivacyGuardian, your AI assistant for privacy rights under the DPDP Act. How can I assist you today?"
         }
 
-    # ----- Delete all data (store request) -----
     if "delete all my data" in msg_lower or "delete all data" in msg_lower:
         await store_deletion_request(user_id, "all")
-        await logger_svc.log_action(user_id, "delete_all_requested", None)
         return {"action": "delete_all", "response": "Your request to delete all data has been submitted for admin approval. You will be notified once it is processed."}
 
-    # ----- General data deletion requests (for ambiguous requests) -----
     if ("delete" in msg_lower and "data" in msg_lower) or ("delete" in msg_lower and "information" in msg_lower):
         field_keywords = ["aadhaar", "pan", "phone", "email", "address", "passport", "driving", "account", "bank"]
         if not any(kw in msg_lower for kw in field_keywords):
@@ -173,7 +166,6 @@ async def keyword_fallback(user_id: str, message: str, logger_svc) -> dict:
                 "response": "I can help you delete specific data like your phone number, email, aadhaar, PAN, address, passport, driving license, or bank account. Please tell me which one you'd like to delete, or say 'delete all my data' to remove everything."
             }
 
-    # ----- Field deletions (store request) -----
     fields = {
         "aadhaar": ["aadhaar", "aadhar"],
         "pan": ["pan"],
@@ -189,18 +181,13 @@ async def keyword_fallback(user_id: str, message: str, logger_svc) -> dict:
         for kw in keywords:
             if f"delete my {kw}" in msg_lower or f"remove my {kw}" in msg_lower:
                 await store_deletion_request(user_id, field)
-                await logger_svc.log_action(user_id, f"delete_field_requested:{field}", field)
                 return {"action": "delete_field", "field": field, "response": f"Your request to delete your {field.replace('_', ' ')} has been submitted for admin approval. You will be notified once it is processed."}
 
-    # ----- If nothing matched -----
     return {"action": "unknown", "response": "I'm not sure how to help. Try asking to delete your data or about your rights."}
 
 # ===================== CHATBOT PROCESSOR =====================
 async def process_chat(user_id: str, message: str) -> dict:
     history = memory.get_history(user_id)
-
-    # Initialize services (only compliance logger is used now)
-    logger_svc = ComplianceLogger(db)
 
     # Try AI interpretation first
     try:
@@ -211,43 +198,31 @@ async def process_chat(user_id: str, message: str) -> dict:
         ai_reply = intent.get("response", "")
     except Exception as e:
         logger.error(f"Hugging Face API call failed, falling back to keywords: {e}")
-        fallback_result = await keyword_fallback(user_id, message, logger_svc)
+        fallback_result = await keyword_fallback(user_id, message)
         action = fallback_result["action"]
         field = fallback_result.get("field")
         ai_reply = fallback_result.get("response", "")
-        result = {
-            "action": action,
-            "field": field,
-            "response": ai_reply
-        }
+        result = {"action": action, "field": field, "response": ai_reply}
         memory.add_message(user_id, message, result["response"])
         return result
 
-    # Log the action locally
-    await logger_svc.log_action(user_id, action, field)
-
-    result = {
-        "action": action,
-        "field": field,
-        "response": ai_reply
-    }
+    # No compliance logger in standalone version; we could add later
+    result = {"action": action, "field": field, "response": ai_reply}
 
     if action == "delete_field" and field:
-        # Store deletion request instead of deleting directly
         await store_deletion_request(user_id, field)
         result["response"] = ai_reply or f"Your request to delete your {field} has been submitted for admin approval. You will be notified once it is processed."
     elif action == "delete_all":
         await store_deletion_request(user_id, "all")
         result["response"] = ai_reply or "Your request to delete all data has been submitted for admin approval. You will be notified once it is processed."
     elif action == "withdraw_consent":
-        result["response"] = ai_reply or "Your consent has been withdrawn."  # This could also be a request if needed
+        result["response"] = ai_reply or "Your consent has been withdrawn."
     elif action == "get_data":
-        # For now, just a placeholder – you could implement data retrieval if needed
         result["response"] = ai_reply or "Here is your data..."
     elif action in ["respond", "help"]:
         pass
     else:
-        fallback_result = await keyword_fallback(user_id, message, logger_svc)
+        fallback_result = await keyword_fallback(user_id, message)
         result["action"] = fallback_result["action"]
         result["field"] = fallback_result.get("field")
         result["response"] = fallback_result.get("response", "I'm not sure how to help.")
@@ -295,8 +270,7 @@ async def serve_frontend():
     return HTMLResponse(content=HTML_PAGE)
 
 # ===================== FRONTEND HTML (with User ID input) =====================
-HTML_PAGE = """
-<!DOCTYPE html>
+HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -626,7 +600,6 @@ HTML_PAGE = """
         const userIdInput = document.getElementById('userIdInput');
         const setUserIdBtn = document.getElementById('setUserIdBtn');
 
-        // Load user ID from localStorage or default to empty
         let USER_ID = localStorage.getItem('privacy_user_id') || '';
         userIdInput.value = USER_ID;
 
@@ -764,7 +737,6 @@ HTML_PAGE = """
             });
         });
 
-        // If user ID already exists in localStorage, show a welcome message
         if (USER_ID) {
             addMessage(`Hello! I'm your privacy assistant. Your current User ID is ${USER_ID}. You can change it above. How can I help you today?`);
         } else {
@@ -772,12 +744,4 @@ HTML_PAGE = """
         }
     </script>
 </body>
-</html>
-"""
-
-if __name__ == "__main__":
-    import uvicorn
-    print("🚀 Starting PrivacyGuardian Chatbot Server...")
-    print(f"Using model: {MODEL_NAME}")
-    print("MongoDB connected.")
-    uvicorn.run(app, host="0.0.0.0", port=8900)
+</html>"""
